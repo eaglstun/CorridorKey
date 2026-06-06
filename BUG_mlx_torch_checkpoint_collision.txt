@@ -1,0 +1,122 @@
+BUG: MLX and Torch .safetensors checkpoints collide — installing MLX weights
+     breaks BOTH backends with "Multiple ... checkpoints. Keep exactly one."
+
+Found: 2026-06-06 (CorridorKey @ commit 92e7836, on macOS / Apple Silicon M4 Max)
+Severity: High — following the documented MLX setup makes the tool unusable on
+          both the MLX and the Torch backend until one weights file is removed.
+
+------------------------------------------------------------------------------
+SUMMARY
+------------------------------------------------------------------------------
+The README's MLX setup instructs the user to place the MLX weights at:
+
+    CorridorKeyModule/checkpoints/corridorkey_mlx.safetensors
+
+while the Torch green checkpoint already lives in the same directory as:
+
+    CorridorKeyModule/checkpoints/CorridorKey_v1.0.safetensors
+
+Checkpoint discovery (_discover_checkpoint in CorridorKeyModule/backend.py)
+distinguishes checkpoints by SCREEN COLOR (the substring "blue" vs not) but NOT
+by BACKEND. Both files use the .safetensors extension and neither contains the
+"blue" token, so both are treated as valid "green" candidates for either
+backend. With two candidates, discovery raises ValueError "Multiple ...
+checkpoints. Keep exactly one." — for BOTH the Torch and the MLX path.
+
+Net effect: doing exactly what the README says (so the two weights coexist)
+bricks the tool on both backends.
+
+------------------------------------------------------------------------------
+REPRODUCTION
+------------------------------------------------------------------------------
+1. Install with MLX:           uv sync --extra mlx
+2. Let the Torch green ckpt auto-download on first run (creates
+   CorridorKeyModule/checkpoints/CorridorKey_v1.0.safetensors), OR place it
+   manually.
+3. Obtain the MLX weights and place them exactly where the README says:
+       CorridorKeyModule/checkpoints/corridorkey_mlx.safetensors
+   (Aside: the bundled `python -m corridorkey_mlx weights download` defaults to
+   release tag "latest", which does not exist — the release is tagged v1.0.0 —
+   and even with --tag v1.0.0 it reported "Release not found"; downloading the
+   asset directly via `gh release download v1.0.0 -R nikopueringer/corridorkey-mlx`
+   works. That is a separate downloader issue, not this bug.)
+4. Run inference on EITHER backend, e.g.:
+       uv run corridorkey run-inference --backend torch
+       uv run corridorkey run-inference --backend mlx
+
+Observed (both backends):
+    ValueError: Multiple .safetensors green checkpoints in
+    CorridorKeyModule/checkpoints:
+    ['corridorkey_mlx.safetensors', 'CorridorKey_v1.0.safetensors'].
+    Keep exactly one.
+
+Expected:
+    --backend torch loads CorridorKey_v1.0.safetensors
+    --backend mlx   loads corridorkey_mlx.safetensors
+    (the two coexist, exactly as the README's MLX section implies).
+
+------------------------------------------------------------------------------
+ROOT CAUSE
+------------------------------------------------------------------------------
+In CorridorKeyModule/backend.py:
+
+  - MLX_EXT == SAFETENSORS_EXT == ".safetensors"  (the two backends share the
+    extension), so _find_single(".safetensors") returns BOTH files.
+  - _filter_by_color() only separates "blue" from "green" by filename token.
+    Neither file contains "blue", so both survive as "green".
+  - The Torch branch and the MLX branch therefore each see 2 candidates and
+    raise the "Multiple ... checkpoints" ValueError.
+
+There is already a canonical MLX filename constant in the module
+(MLX_MODEL_FILENAME = "corridorkey_mlx.safetensors") and the official download
+asset is named corridorkey_mlx.safetensors — i.e. the "mlx" token in the
+filename is a reliable, already-established signal that the code simply was not
+using during discovery.
+
+------------------------------------------------------------------------------
+FIX (applied locally in this working tree)
+------------------------------------------------------------------------------
+Make discovery backend-aware in CorridorKeyModule/backend.py by keying on an
+"mlx" filename token (mirrors the existing BLUE_FILENAME_TOKEN convention):
+
+  1. New helper + token:
+       MLX_FILENAME_TOKEN = "mlx"
+       def _is_mlx_file(path): return "mlx" in os.path.basename(path).lower()
+
+  2. Torch branch: exclude MLX-named files from the .safetensors candidates, so
+     the MLX weights never collide with the Torch weights:
+       torch_safetensors = [p for p in _find_single(SAFETENSORS_EXT)
+                            if not _is_mlx_file(p)]
+       safetensors_matches = _filter_by_color(torch_safetensors, screen_color)
+
+  3. MLX branch: PREFER an MLX-named file when present (disambiguates against a
+     coexisting Torch .safetensors) but fall back to any lone .safetensors so the
+     previous contract — and the existing test that uses "model.safetensors" —
+     still passes:
+       candidates = _filter_by_color(_find_single(ext), screen_color)
+       mlx_named  = [p for p in candidates if _is_mlx_file(p)]
+       matches    = mlx_named or candidates
+
+Result after fix (both files present in checkpoints/):
+    torch -> CorridorKey_v1.0.safetensors
+    mlx   -> corridorkey_mlx.safetensors
+
+Verification:
+    uv run ruff check CorridorKeyModule/backend.py        -> All checks passed!
+    uv run pytest tests/test_backend.py \
+                  tests/test_pbt_backend_resolution.py -q  -> 38 passed
+    uv run pytest -q -m "not gpu"                          -> full fast suite green
+
+------------------------------------------------------------------------------
+NOTES / FOLLOW-UPS
+------------------------------------------------------------------------------
+- The "mlx" substring is a heuristic. It is safe for the shipped names
+  (CorridorKey_v1.0 / CorridorKeyBlue_1.0 for Torch; corridorkey_mlx for MLX),
+  but a stricter match on MLX_MODEL_FILENAME could be used if a naming scheme is
+  ever formalized.
+- Consider documenting the per-backend filename convention in the README's MLX
+  section so users (and any manual weight conversions) keep the "mlx" token.
+- Related but SEPARATE issue worth filing: `python -m corridorkey_mlx weights
+  download` cannot fetch the release (default tag "latest" missing; --tag v1.0.0
+  also failed with "Release not found"). The GitHub release v1.0.0 does contain
+  corridorkey_mlx.safetensors + .sha256, reachable via `gh`.
